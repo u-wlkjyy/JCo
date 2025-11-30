@@ -20,6 +20,71 @@ public class Coroutine {
 
     private static final ThreadLocal<StructuredTaskScope<Object>> SCOPE_CONTEXT = new ThreadLocal<>();
 
+
+    public static class Dispatchers {
+        /**
+         * 默认调度器 (CPU 密集型)
+         * 使用固定大小的线程池（核心数），且设置为 Daemon 线程，避免阻塞进程退出
+         */
+        public static final ExecutorService Default;
+
+        /**
+         * 虚拟线程调度器 (IO 密集型 / 默认)
+         * 显式暴露出来，以便 withContext 切回虚拟线程时使用
+         */
+        public static final ExecutorService Virtual;
+
+        static {
+            // 1. 初始化 CPU 密集型线程池
+            int cores = Runtime.getRuntime().availableProcessors();
+            Default = Executors.newFixedThreadPool(cores + 1, r -> {
+                Thread t = new Thread(r, "coroutine-dispatcher-default");
+                t.setDaemon(true); // ✅ 关键：设为守护线程，防止进程无法结束
+                return t;
+            });
+
+            // 2. 初始化虚拟线程执行器
+            Virtual = Executors.newVirtualThreadPerTaskExecutor();
+        }
+    }
+
+    /**
+     * 切换线程上下文执行任务，并挂起当前虚拟线程等待结果。
+     * 类似 Kotlin 的 withContext
+     *
+     * @param dispatcher 目标线程池 (如 Dispatchers.Default)
+     * @param block      要执行的代码块
+     * @return 执行结果
+     */
+    public static <T> T withContext(ExecutorService dispatcher, Callable<T> block) {
+        // 1. 将任务提交到目标线程池
+        CompletableFuture<T> future = CompletableFuture.supplyAsync(() -> {
+            try {
+                return block.call();
+            } catch (Exception e) {
+                // 包装受检异常，以便在 Future 中传递
+                if (e instanceof RuntimeException rex) throw rex;
+                throw new CompletionException(e);
+            }
+        }, dispatcher);
+
+        try {
+            // 2. 挂起当前虚拟线程 (非阻塞物理线程)，直到目标线程执行完毕
+            return future.get();
+        } catch (InterruptedException e) {
+            // 处理中断
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted during withContext", e);
+        } catch (ExecutionException e) {
+            // 3. 解包异常，抛出原始错误
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException rex) throw rex;
+            if (cause instanceof Error err) throw err;
+            throw new RuntimeException(cause);
+        }
+    }
+
+
     // ==========================================
     // 1. 核心接口
     // ==========================================
