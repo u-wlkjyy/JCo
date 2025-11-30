@@ -168,8 +168,22 @@ public class Coroutine {
     // ==========================================
     // 4. 基础启动器
     // ==========================================
+    
+    /**
+     * 启动协程作用域（无返回值版本）
+     * @param block 要执行的代码块
+     */
     public static void runBlocking(Runnable block) {
         withScope(new StructuredTaskScope.ShutdownOnFailure(), () -> { block.run(); return null; }, true);
+    }
+
+    /**
+     * 启动协程作用域（有返回值版本）
+     * @param block 要执行的代码块
+     * @return 代码块的返回值
+     */
+    public static <T> T runBlocking(Callable<T> block) {
+        return withScope(new StructuredTaskScope.ShutdownOnFailure(), block, true);
     }
 
     public static void supervisorScope(Runnable block) {
