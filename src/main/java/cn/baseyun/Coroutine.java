@@ -20,7 +20,6 @@ public class Coroutine {
 
     private static final ThreadLocal<StructuredTaskScope<Object>> SCOPE_CONTEXT = new ThreadLocal<>();
 
-
     public static class Dispatchers {
         /**
          * 默认调度器 (CPU 密集型)
@@ -39,12 +38,16 @@ public class Coroutine {
             int cores = Runtime.getRuntime().availableProcessors();
             Default = Executors.newFixedThreadPool(cores + 1, r -> {
                 Thread t = new Thread(r, "coroutine-dispatcher-default");
-                t.setDaemon(true); // ✅ 关键：设为守护线程，防止进程无法结束
+                t.setDaemon(true);
                 return t;
             });
 
             // 2. 初始化虚拟线程执行器
-            Virtual = Executors.newVirtualThreadPerTaskExecutor();
+            ThreadFactory virtualFactory = Thread.ofVirtual()
+                    .name("coroutine-virtual-", 0)
+                    .factory();
+
+            Virtual = Executors.newThreadPerTaskExecutor(virtualFactory);
         }
     }
 
@@ -117,6 +120,25 @@ public class Coroutine {
         );
     }
 
+    /**
+     * [新增] 超时控制（返回 Null 而不抛出异常）
+     * 类似 Kotlin 的 withTimeoutOrNull
+     */
+    public static <T> T withTimeoutOrNull(long millis, Callable<T> block) {
+        try {
+            return withTimeout(millis, block);
+        } catch (Exception e) {
+            // 原始 withTimeout 抛出的异常被 unwrapAndThrow 转换为 RuntimeException
+            // 根本原因是 TimeoutException
+            if (e.getCause() instanceof TimeoutException) {
+                return null;
+            }
+            // 如果是其他业务异常，继续抛出
+            if (e instanceof RuntimeException rex) throw rex;
+            throw new RuntimeException(e);
+        }
+    }
+
     // ==========================================
     // 3. 竞速模式 (区分语义)
     // ==========================================
@@ -168,17 +190,22 @@ public class Coroutine {
     // ==========================================
     // 4. 基础启动器
     // ==========================================
-    
+
     /**
      * 启动协程作用域（无返回值版本）
+     *
      * @param block 要执行的代码块
      */
     public static void runBlocking(Runnable block) {
-        withScope(new StructuredTaskScope.ShutdownOnFailure(), () -> { block.run(); return null; }, true);
+        withScope(new StructuredTaskScope.ShutdownOnFailure(), () -> {
+            block.run();
+            return null;
+        }, true);
     }
 
     /**
      * 启动协程作用域（有返回值版本）
+     *
      * @param block 要执行的代码块
      * @return 代码块的返回值
      */
@@ -187,21 +214,69 @@ public class Coroutine {
     }
 
     public static void supervisorScope(Runnable block) {
-        withScope(new StructuredTaskScope<Object>(), () -> { block.run(); return null; }, false);
+        withScope(new StructuredTaskScope<Object>(), () -> {
+            block.run();
+            return null;
+        }, false);
     }
 
+    // --- Launch 重载 ---
+
+    /**
+     * 默认 Launch：在虚拟线程中执行
+     */
     public static void launch(Runnable block) {
-        async(() -> { block.run(); return null; });
+        async(() -> {
+            block.run();
+            return null;
+        });
     }
 
+    /**
+     * 带名称的 Launch
+     */
     public static void launch(String name, Runnable block) {
         async(() -> {
             String oldName = Thread.currentThread().getName();
             Thread.currentThread().setName(name);
-            try { block.run(); return null; } finally { Thread.currentThread().setName(oldName); }
+            try {
+                block.run();
+                return null;
+            } finally {
+                Thread.currentThread().setName(oldName);
+            }
         });
     }
 
+    public static void launch(ExecutorService dispatcher, Runnable block) {
+
+        async(dispatcher, () -> {
+            block.run();
+            return null;
+        });
+    }
+
+    /**
+     * [新增] 带名称且指定调度器的 Launch
+     */
+    public static void launch(String name, ExecutorService dispatcher, Runnable block) {
+        async(dispatcher, () -> {
+            String oldName = Thread.currentThread().getName();
+            Thread.currentThread().setName(name);
+            try {
+                block.run();
+                return null;
+            } finally {
+                Thread.currentThread().setName(oldName);
+            }
+        });
+    }
+
+    // --- Async 重载 ---
+
+    /**
+     * 默认 Async：在虚拟线程中执行
+     */
     public static <T> Job<T> async(Callable<T> block) {
         StructuredTaskScope<Object> scope = getScopeOrThrow();
 
@@ -211,6 +286,7 @@ public class Coroutine {
         scope.fork(() -> {
             worker.set(Thread.currentThread());
             try {
+                // 递归创建新的 Scope，确保层级结构
                 T res = withScope(new StructuredTaskScope.ShutdownOnFailure(), block::call, true);
                 future.complete(res);
                 return res;
@@ -224,57 +300,88 @@ public class Coroutine {
             public T await() {
                 try {
                     return future.get();
-                } catch (InterruptedException e) { throw new RuntimeException(e); }
-                catch (ExecutionException e) { unwrapAndThrow(e); return null; }
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                } catch (ExecutionException e) {
+                    unwrapAndThrow(e);
+                    return null;
+                }
             }
+
             public void cancel() {
                 if (future.cancel(true)) {
                     Thread t = worker.get();
                     if (t != null) t.interrupt();
                 }
             }
-            public boolean isDone() { return future.isDone(); }
+
+            public boolean isDone() {
+                return future.isDone();
+            }
         };
     }
 
-    // ==========================================
-    // 5. 集合并发
-    // ==========================================
+    public static <T> Job<T> async(ExecutorService dispatcher, Callable<T> block) {
+        return async(() -> withContext(dispatcher, block));
+    }
+
     public static <T, R> Batch<R> map(Collection<T> list, Function<T, R> mapper) {
         List<Job<R>> jobs = new ArrayList<>(list.size());
         for (T item : list) jobs.add(async(() -> mapper.apply(item)));
         return new Batch<>(jobs);
     }
 
+    public static <T> void forEachParallel(Collection<T> list, Consumer<T> action) {
+        map(list, item -> {
+            action.accept(item);
+            return null;
+        }).awaitAll();
+    }
+
+
+    public static <T> List<T> awaitAll(Collection<Job<T>> jobs) {
+        List<T> results = new ArrayList<>(jobs.size());
+        for (Job<T> job : jobs) {
+            results.add(job.await());
+        }
+        return results;
+    }
+
+
+    @SafeVarargs
+    public static <T> List<T> awaitAll(Job<T>... jobs) {
+        return awaitAll(Arrays.asList(jobs));
+    }
+
     public static class Batch<T> {
         private final List<Job<T>> jobs;
-        public Batch(List<Job<T>> jobs) { this.jobs = jobs; }
+
+        public Batch(List<Job<T>> jobs) {
+            this.jobs = jobs;
+        }
+
         public List<T> awaitAll() {
             List<T> res = new ArrayList<>(jobs.size());
             for (Job<T> j : jobs) res.add(j.await());
             return res;
         }
-        public void cancelAll() { for (Job<T> j : jobs) j.cancel(); }
+
+        public void cancelAll() {
+            for (Job<T> j : jobs) j.cancel();
+        }
     }
 
-    // ==========================================
-    // 6. 辅助工具 & 内部实现
-    // ==========================================
-
-    // 获取上下文，如果丢失则抛出详细错误
     private static StructuredTaskScope<Object> getScopeOrThrow() {
         StructuredTaskScope<Object> scope = SCOPE_CONTEXT.get();
         if (scope == null) {
             throw new IllegalStateException(
                     "Coroutine Context Lost! \n" +
-                            "Cause: You are trying to call 'async/launch' outside of a 'runBlocking' scope.\n" +
-                            "Common mistake: Calling launch inside a manual 'new Thread()' or 'ThreadPool', which breaks the ThreadLocal chain."
+                            "Cause: You are trying to call 'async/launch' outside of a 'runBlocking' scope.\n"
             );
         }
         return scope;
     }
 
-    // 异常解包工具
     private static void unwrapAndThrow(ExecutionException e) {
         Throwable cause = e.getCause();
         if (cause instanceof RuntimeException rex) throw rex;
@@ -282,16 +389,32 @@ public class Coroutine {
     }
 
     public static void delay(long ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException e) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted");
         }
     }
 
+
+    public static void yield() {
+        if (Thread.interrupted()) {
+            throw new RuntimeException(new InterruptedException("Coroutine was cancelled"));
+        }
+        Thread.yield();
+    }
+
     public static class Mutex {
         private final ReentrantLock lock = new ReentrantLock();
+
         public void withLock(Runnable action) {
-            lock.lock(); try { action.run(); } finally { lock.unlock(); }
+            lock.lock();
+            try {
+                action.run();
+            } finally {
+                lock.unlock();
+            }
         }
     }
 
@@ -318,12 +441,14 @@ public class Coroutine {
 
     private static class ShutdownOnFirst<T> extends StructuredTaskScope<T> {
         private final AtomicReference<Subtask<? extends T>> firstResult = new AtomicReference<>();
+
         @Override
         protected void handleComplete(Subtask<? extends T> subtask) {
             if (firstResult.compareAndSet(null, subtask)) {
                 shutdown();
             }
         }
+
         public T result() throws ExecutionException {
             Subtask<? extends T> subtask = firstResult.get();
             if (subtask == null) throw new ExecutionException(new NoSuchElementException("No tasks completed"));

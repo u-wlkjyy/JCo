@@ -11,13 +11,13 @@
 ## 核心特性
 
 *   **零依赖**：基于原生 JDK 21，无任何第三方库依赖，极致轻量。
-*   **Kotlin 风格 API**：`runBlocking`, `launch`, `async`, `await`, `delay`... 保持原汁原味。
-*   **线程调度器**：提供 `Dispatchers.Default`（CPU密集型）和 `Dispatchers.Virtual`（IO密集型），支持 `withContext` 切换执行上下文。
+*   **Kotlin 风格 API**：`runBlocking`, `launch`, `async`, `await`, `delay`, `yield`... 保持原汁原味。
+*   **线程调度器**：提供 `Dispatchers.Default`（CPU密集型）和 `Dispatchers.Virtual`（IO密集型），支持 `withContext` 和调度器参数切换执行上下文。
 *   **智能竞速**：
     *   `race`: 谁快选谁（一完即止，适用于超时控制）。
     *   `raceSuccess`: 谁成选谁（一成即止，适用于高可用调用）。
 *   **结构化并发**：自动管理线程生命周期，父协程自动等待子协程，异常自动传播。
-*   **集合并发流**：`map` + `awaitAll`，一行代码实现 List 并发处理。
+*   **集合并发流**：`map`、`forEachParallel`、`awaitAll`，一行代码实现 List 并发处理。
 *   **协程锁**：提供 `Mutex`，防止虚拟线程 Pinning 的安全锁。
 *   **容错机制**：支持 `supervisorScope`，单任务失败不影响全局。
 
@@ -56,13 +56,26 @@ runBlocking(() -> {
 一行代码并发处理整个 List，替代复杂的 `CompletableFuture` 流式处理。
 
 ```java
-List<Integer> ids = List.of(1, 2, 3, 4, 5);
+runBlocking(() -> {
+    List<Integer> ids = List.of(1, 2, 3, 4, 5);
 
-// 并发调用接口
-List<String> results = map(ids, id -> {
-    delay(100); // 模拟耗时
-    return "User-" + id;
-}).awaitAll();
+    // 方式1: 使用 map + awaitAll 获取结果
+    List<String> results = map(ids, id -> {
+        delay(100); // 模拟耗时
+        return "User-" + id;
+    }).awaitAll();
+
+    // 方式2: 使用 forEachParallel 仅执行操作（无返回值）
+    forEachParallel(ids, id -> {
+        delay(100);
+        System.out.println("Processing: " + id);
+    });
+
+    // 方式3: 使用 awaitAll 等待多个 Job
+    Job<String> job1 = async(() -> "Result1");
+    Job<String> job2 = async(() -> "Result2");
+    List<String> allResults = awaitAll(job1, job2);
+});
 ```
 
 ### 3. 两种竞速模式 (Race)
@@ -71,45 +84,52 @@ List<String> results = map(ids, id -> {
 适用于超时控制或多路复用。只要有一个结束（无论成功失败），立即返回。
 
 ```java
-try {
-    String result = race(
-        () -> { delay(2000); return "慢服务"; },
-        () -> { delay(100); throw new RuntimeException("快服务崩了"); }
-    );
-} catch (Exception e) {
-    // 这里会捕获到异常，因为"快服务"先结束了(虽然是失败)
-    System.out.println("捕获异常: " + e.getMessage());
-}
+runBlocking(() -> {
+    try {
+        String result = race(
+            () -> { delay(2000); return "慢服务"; },
+            () -> { delay(100); throw new RuntimeException("快服务崩了"); }
+        );
+    } catch (Exception e) {
+        // 这里会捕获到异常，因为"快服务"先结束了(虽然是失败)
+        System.out.println("捕获异常: " + e.getMessage());
+    }
+});
 ```
 
 **场景 B：`raceSuccess` (谁成选谁)**
 适用于高可用(HA)场景。忽略失败，直到有一个成功。
 
 ```java
-String result = raceSuccess(
-    () -> { delay(100); throw new RuntimeException("节点A挂了"); },
-    () -> { delay(500); return "节点B数据"; },
-    () -> { delay(2000); return "节点C数据"; }
-);
-// 输出: 节点B数据 (自动忽略了A的错误，且不需要等C)
+runBlocking(() -> {
+    String result = raceSuccess(
+        () -> { delay(100); throw new RuntimeException("节点A挂了"); },
+        () -> { delay(500); return "节点B数据"; },
+        () -> { delay(2000); return "节点C数据"; }
+    );
+    // 输出: 节点B数据 (自动忽略了A的错误，且不需要等C)
+    System.out.println(result);
+});
 ```
 
 ### 4. 超时控制 & 重复执行
 
 ```java
-// 超时控制
-try {
-    String res = withTimeout(1000, () -> {
-        delay(2000);
-        return "永远拿不到";
-    });
-} catch (RuntimeException e) {
-    System.out.println("任务超时！");
-}
+runBlocking(() -> {
+    // 超时控制
+    try {
+        String res = withTimeout(1000, () -> {
+            delay(2000);
+            return "永远拿不到";
+        });
+    } catch (RuntimeException e) {
+        System.out.println("任务超时！");
+    }
 
-// 简单的重复执行
-repeat(10, i -> {
-    launch(() -> System.out.println("Task " + i));
+    // 简单的重复执行
+    repeat(10, i -> {
+        launch(() -> System.out.println("Task " + i));
+    });
 });
 ```
 
@@ -118,9 +138,17 @@ repeat(10, i -> {
 
 ```java
 Mutex mutex = new Mutex();
-// ... inside coroutine
-mutex.withLock(() -> {
-    count++; // 安全操作
+AtomicInteger count = new AtomicInteger(0);
+
+runBlocking(() -> {
+    // 启动多个并发任务
+    repeat(100, i -> {
+        launch(() -> {
+            mutex.withLock(() -> {
+                count.incrementAndGet(); // 安全操作
+            });
+        });
+    });
 });
 ```
 
@@ -149,6 +177,57 @@ runBlocking(() -> {
 - `Dispatchers.Default`：固定线程池（CPU 核心数+1，适合 CPU 密集型）
 
 **注意**：`withContext` 会挂起当前虚拟线程等待结果，但不会阻塞物理线程。
+
+### 7. 指定调度器启动协程
+
+除了使用 `withContext` 切换上下文，你还可以在启动协程时直接指定调度器：
+
+```java
+runBlocking(() -> {
+    // 在 CPU 线程池中启动协程
+    Job<Integer> cpuTask = async(Dispatchers.Default, () -> {
+        // CPU 密集型计算
+        return heavyComputation();
+    });
+    
+    // 在虚拟线程中启动（默认）
+    Job<String> ioTask = async(Dispatchers.Virtual, () -> {
+        // IO 操作
+        return fetchData();
+    });
+    
+    // 使用 launch 指定调度器（无返回值）
+    launch(Dispatchers.Default, () -> {
+        performBackgroundWork();
+    });
+    
+    System.out.println(cpuTask.await() + " " + ioTask.await());
+});
+```
+
+### 8. 协程控制：yield
+
+使用 `yield()` 让出执行权，允许其他协程运行，同时检查取消状态：
+
+```java
+runBlocking(() -> {
+    Job<Void> task = async(() -> {
+        for (int i = 0; i < 1000; i++) {
+            // 执行工作
+            doWork(i);
+            
+            // 定期让出执行权，允许取消
+            if (i % 100 == 0) {
+                yield(); // 检查是否被取消
+            }
+        }
+        return null;
+    });
+    
+    delay(100);
+    task.cancel(); // 取消任务
+});
+```
 
 ## 重要限制 (Limitations)
 
