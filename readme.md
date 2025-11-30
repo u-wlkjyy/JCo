@@ -12,6 +12,7 @@
 
 *   **零依赖**：基于原生 JDK 21，无任何第三方库依赖，极致轻量。
 *   **Kotlin 风格 API**：`runBlocking`, `launch`, `async`, `await`, `delay`... 保持原汁原味。
+*   **线程调度器**：提供 `Dispatchers.Default`（CPU密集型）和 `Dispatchers.Virtual`（IO密集型），支持 `withContext` 切换执行上下文。
 *   **智能竞速**：
     *   `race`: 谁快选谁（一完即止，适用于超时控制）。
     *   `raceSuccess`: 谁成选谁（一成即止，适用于高可用调用）。
@@ -122,6 +123,32 @@ mutex.withLock(() -> {
     count++; // 安全操作
 });
 ```
+
+### 6. 线程调度器 (Dispatchers) 与上下文切换
+
+**场景**：当你需要在协程中执行 CPU 密集型计算时，可以使用 `withContext` 切换到专用线程池，避免阻塞虚拟线程调度器。
+
+```java
+runBlocking(() -> {
+    // 在虚拟线程中执行 IO 操作
+    String data = fetchDataFromAPI();
+    
+    // 切换到 CPU 线程池执行计算密集型任务
+    Integer result = withContext(Dispatchers.Default, () -> {
+        // 这里运行在固定大小的线程池中
+        return heavyComputation(data);
+    });
+    
+    // 自动切回虚拟线程继续执行
+    saveResult(result);
+});
+```
+
+**可用调度器**：
+- `Dispatchers.Virtual`：虚拟线程调度器（默认，适合 IO 密集型）
+- `Dispatchers.Default`：固定线程池（CPU 核心数+1，适合 CPU 密集型）
+
+**注意**：`withContext` 会挂起当前虚拟线程等待结果，但不会阻塞物理线程。
 
 ## 重要限制 (Limitations)
 
